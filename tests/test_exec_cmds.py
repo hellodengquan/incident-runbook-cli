@@ -1,0 +1,404 @@
+from __future__ import annotations
+
+import json
+from datetime import datetime
+from pathlib import Path
+
+import pytest
+
+from runbook_cli.commands import runbook_cmds
+from runbook_cli.commands import exec_cmds
+from runbook_cli.commands import history_cmds
+from runbook_cli import main as _main_mod
+from runbook_cli.models import (
+    ExecutionStatus,
+    RunbookStatus,
+    SeverityLevel,
+    StepStatus,
+)
+
+
+@pytest.fixture(autouse=True)
+def _patch_storage_refs(monkeypatch, tmp_storage):
+    monkeypatch.setattr(runbook_cmds, "storage", tmp_storage)
+    monkeypatch.setattr(exec_cmds, "storage", tmp_storage)
+    monkeypatch.setattr(history_cmds, "storage", tmp_storage)
+    monkeypatch.setattr(_main_mod, "storage", tmp_storage)
+    yield
+
+
+@pytest.fixture
+def _seeded(tmp_storage, sample_runbook, sample_runbook_2, sample_execution, completed_execution):
+    tmp_storage.save_runbook(sample_runbook)
+    tmp_storage.save_runbook(sample_runbook_2)
+    tmp_storage.save_execution(sample_execution)
+    tmp_storage.save_execution(completed_execution)
+    yield
+
+
+class TestExecStart:
+    def test_start_new(self, cli_runner, app, tmp_storage, sample_runbook):
+        tmp_storage.save_runbook(sample_runbook)
+        result = cli_runner.invoke(
+            app,
+            [
+                "exec", "start", "MySQL 切换",
+                "--operator", "李四",
+                "--incident-id", "INC-TEST-001",
+            ],
+        )
+        assert result.exit_code == 0, result.stdout
+        assert "执行会话已创建" in result.stdout
+        active = tmp_storage.get_active_execution()
+        assert active is not None
+        assert active.runbook_id == sample_runbook.id
+        assert active.operator == "李四"
+        assert active.incident_id == "INC-TEST-001"
+        assert active.status == ExecutionStatus.RUNNING
+        assert len(active.steps) == 3
+        for s in active.steps:
+            assert s.status == StepStatus.PENDING
+
+    def test_start_active_exists_cancel(self, cli_runner, app, _seeded, tmp_storage):
+        count_before = len(tmp_storage.list_executions())
+        result = cli_runner.invoke(
+            app,
+            ["exec", "start", "MySQL 切换"],
+            input="n\n",
+        )
+        assert result.exit_code == 0
+        assert len(tmp_storage.list_executions()) == count_before
+
+    def test_start_nonactive_runbook_confirm(self, cli_runner, app, tmp_storage, sample_runbook_2):
+        tmp_storage.save_runbook(sample_runbook_2)
+        assert sample_runbook_2.status == RunbookStatus.DRAFT
+        result = cli_runner.invoke(
+            app,
+            ["exec", "start", "K8s 节点异常"],
+            input="y\n",
+        )
+        assert result.exit_code == 0, result.stdout
+        assert tmp_storage.get_active_execution() is not None
+
+    def test_start_missing_runbook(self, cli_runner, app):
+        result = cli_runner.invoke(app, ["exec", "start", "不存在"])
+        assert result.exit_code != 0
+        assert "预案不存在" in result.stdout
+
+    def test_start_runbook_no_steps(self, cli_runner, app, tmp_storage):
+        from runbook_cli.models import Runbook
+        tmp_storage.save_runbook(Runbook(id="rb-empty", name="空预案", status=RunbookStatus.ACTIVE))
+        result = cli_runner.invoke(app, ["exec", "start", "空预案"])
+        assert result.exit_code != 0
+        assert "没有定义执行步骤" in result.stdout
+
+
+class TestExecStatusCurrent:
+    def test_status_active(self, cli_runner, app, _seeded):
+        result = cli_runner.invoke(app, ["exec", "status"])
+        assert result.exit_code == 0
+        assert "执行状态" in result.stdout
+        assert "INC-20260610-001" in result.stdout
+
+    def test_status_specific_id(self, cli_runner, app, _seeded):
+        result = cli_runner.invoke(app, ["exec", "status", "--id", "ex002"])
+        assert result.exit_code == 0
+        assert "ex002" in result.stdout
+
+    def test_status_no_active(self, cli_runner, app, tmp_storage, completed_execution):
+        tmp_storage.save_execution(completed_execution)
+        result = cli_runner.invoke(app, ["exec", "status"])
+        assert result.exit_code == 0
+        assert "暂无进行中的执行会话" in result.stdout
+
+    def test_current(self, cli_runner, app, _seeded):
+        result = cli_runner.invoke(app, ["exec", "current"])
+        assert result.exit_code == 0
+        assert "MySQL 切换" in result.stdout
+
+
+class TestExecStep:
+    def test_step_start_by_shortcut(self, cli_runner, app, tmp_storage, sample_runbook, sample_execution):
+        tmp_storage.save_runbook(sample_runbook)
+        tmp_storage.save_execution(sample_execution)
+        result = cli_runner.invoke(
+            app,
+            ["exec", "step", "3", "--notes", "开始切换"],
+        )
+        assert result.exit_code == 0, result.stdout
+        assert "开始执行步骤 3" in result.stdout
+        ex = tmp_storage.load_execution(sample_execution.id)
+        assert ex.steps[2].status == StepStatus.IN_PROGRESS
+        assert ex.steps[2].started_at is not None
+        assert ex.steps[2].notes == "开始切换"
+
+    def test_step_complete_current(self, cli_runner, app, tmp_storage, sample_runbook, sample_execution):
+        tmp_storage.save_runbook(sample_runbook)
+        tmp_storage.save_execution(sample_execution)
+        cli_runner.invoke(app, ["exec", "step", "3"])
+        result = cli_runner.invoke(
+            app,
+            ["exec", "step", "complete", "--notes", "切换成功"],
+        )
+        assert result.exit_code == 0
+        assert "步骤 3 已完成" in result.stdout
+        ex = tmp_storage.load_execution(sample_execution.id)
+        assert ex.steps[2].status == StepStatus.COMPLETED
+        assert ex.steps[2].completed_at is not None
+        assert "切换成功" in ex.steps[2].notes
+
+    def test_step_skip(self, cli_runner, app, tmp_storage, sample_runbook, sample_execution):
+        tmp_storage.save_runbook(sample_runbook)
+        tmp_storage.save_execution(sample_execution)
+        result = cli_runner.invoke(
+            app,
+            ["exec", "step", "skip", "3", "--notes", "无需切换"],
+        )
+        assert result.exit_code == 0
+        assert "已跳过步骤 3" in result.stdout
+        ex = tmp_storage.load_execution(sample_execution.id)
+        assert ex.steps[2].status == StepStatus.SKIPPED
+
+    def test_step_fail(self, cli_runner, app, tmp_storage, sample_runbook, sample_execution):
+        tmp_storage.save_runbook(sample_runbook)
+        tmp_storage.save_execution(sample_execution)
+        result = cli_runner.invoke(
+            app,
+            ["exec", "step", "fail", "3", "--notes", "从库不一致"],
+        )
+        assert result.exit_code == 0
+        assert "步骤 3 失败" in result.stdout
+        ex = tmp_storage.load_execution(sample_execution.id)
+        assert ex.steps[2].status == StepStatus.FAILED
+        assert ex.status == ExecutionStatus.FAILED
+
+    def test_step_note(self, cli_runner, app, tmp_storage, sample_runbook, sample_execution):
+        tmp_storage.save_runbook(sample_runbook)
+        tmp_storage.save_execution(sample_execution)
+        result = cli_runner.invoke(
+            app,
+            ["exec", "step", "note", "1", "--notes", "追加备注"],
+        )
+        assert result.exit_code == 0
+        assert "已更新步骤 1 的备注" in result.stdout
+        ex = tmp_storage.load_execution(sample_execution.id)
+        assert "追加备注" in ex.steps[0].notes
+
+    def test_step_invalid_action(self, cli_runner, app, _seeded):
+        result = cli_runner.invoke(app, ["exec", "step", "bogus", "1"])
+        assert result.exit_code != 0
+        assert "无效操作" in result.stdout
+
+    def test_step_no_active(self, cli_runner, app, tmp_storage, sample_runbook):
+        from runbook_cli.models import ExecutionRecord, Step
+        rb = sample_runbook
+        tmp_storage.save_runbook(rb)
+        ex = ExecutionRecord(
+            id="ex-fin",
+            runbook_id=rb.id,
+            runbook_name=rb.name,
+            severity=rb.severity,
+            status=ExecutionStatus.COMPLETED,
+            started_at=datetime.now(),
+            completed_at=datetime.now(),
+        )
+        tmp_storage.save_execution(ex)
+        result = cli_runner.invoke(app, ["exec", "step", "1"])
+        assert result.exit_code != 0
+
+    def test_step_paused_rejected(self, cli_runner, app, tmp_storage, sample_runbook, sample_execution):
+        tmp_storage.save_runbook(sample_runbook)
+        sample_execution.status = ExecutionStatus.PAUSED
+        tmp_storage.save_execution(sample_execution)
+        result = cli_runner.invoke(app, ["exec", "step", "1"])
+        assert result.exit_code != 0
+        assert "已暂停" in result.stdout
+
+
+class TestExecPauseResume:
+    def test_pause(self, cli_runner, app, _seeded, tmp_storage):
+        result = cli_runner.invoke(app, ["exec", "pause", "--reason", "等待DBA回电"])
+        assert result.exit_code == 0
+        assert "执行已暂停" in result.stdout
+        ex = tmp_storage.load_execution("ex001")
+        assert ex.status == ExecutionStatus.PAUSED
+        assert ex.paused_at is not None
+        assert "等待DBA回电" in ex.summary
+
+    def test_pause_not_running(self, cli_runner, app, tmp_storage, sample_execution, completed_execution):
+        # 保存两个：completed 非活跃 + sample(running) 但被改为 completed
+        tmp_storage.save_execution(completed_execution)
+        sample_execution.status = ExecutionStatus.COMPLETED
+        sample_execution.completed_at = datetime.now()
+        tmp_storage.save_execution(sample_execution)
+        # 此时无活跃执行
+        result = cli_runner.invoke(app, ["exec", "pause"])
+        # 无活跃执行时 exec pause 会 exit != 0（报错退出）
+        assert result.exit_code != 0
+        assert "暂无进行中的执行会话" in result.stdout or "执行会话已结束" in result.stdout
+
+    def test_pause_no_active(self, cli_runner, app, tmp_storage):
+        result = cli_runner.invoke(app, ["exec", "pause"])
+        assert result.exit_code != 0
+
+    def test_resume(self, cli_runner, app, tmp_storage, sample_execution):
+        sample_execution.status = ExecutionStatus.PAUSED
+        sample_execution.paused_at = datetime.now()
+        tmp_storage.save_execution(sample_execution)
+        result = cli_runner.invoke(app, ["exec", "resume"])
+        assert result.exit_code == 0
+        assert "已恢复执行" in result.stdout
+        ex = tmp_storage.load_execution(sample_execution.id)
+        assert ex.status == ExecutionStatus.RUNNING
+        assert ex.paused_at is None
+
+    def test_resume_not_paused(self, cli_runner, app, _seeded):
+        result = cli_runner.invoke(app, ["exec", "resume"])
+        assert result.exit_code == 0
+        assert "无需恢复" in result.stdout
+
+
+class TestExecFinishAbort:
+    def test_finish_force(self, cli_runner, app, tmp_storage, sample_runbook, sample_execution):
+        tmp_storage.save_runbook(sample_runbook)
+        tmp_storage.save_execution(sample_execution)
+        result = cli_runner.invoke(
+            app,
+            ["exec", "finish", "--force", "--summary", "处理完毕"],
+        )
+        assert result.exit_code == 0, result.stdout
+        assert "执行会话已结束" in result.stdout
+        ex = tmp_storage.load_execution(sample_execution.id)
+        assert ex.status == ExecutionStatus.COMPLETED
+        assert ex.completed_at is not None
+        assert ex.summary == "处理完毕"
+
+    def test_finish_interactive_with_pending(self, cli_runner, app, _seeded, tmp_storage):
+        result = cli_runner.invoke(
+            app,
+            ["exec", "finish", "--summary", "处理总结"],
+            input="y\n",
+        )
+        assert result.exit_code == 0
+        assert "执行会话已结束" in result.stdout
+
+    def test_finish_already_completed(self, cli_runner, app, tmp_storage, sample_execution, completed_execution):
+        # 保存 completed_execution 和 sample（改为 COMPLETED），此时无活跃执行
+        tmp_storage.save_execution(completed_execution)
+        sample_execution.status = ExecutionStatus.COMPLETED
+        sample_execution.completed_at = datetime.now()
+        tmp_storage.save_execution(sample_execution)
+        result = cli_runner.invoke(app, ["exec", "finish", "--force"])
+        # exec finish 当没有活跃执行时会 exit != 0
+        assert result.exit_code != 0
+
+    def test_abort_confirms(self, cli_runner, app, _seeded, tmp_storage):
+        result = cli_runner.invoke(
+            app,
+            ["exec", "abort", "--reason", "人力不足"],
+            input="y\n",
+        )
+        assert result.exit_code == 0
+        assert "执行会话已中止" in result.stdout
+        ex = tmp_storage.load_execution("ex001")
+        assert ex.status == ExecutionStatus.FAILED
+        for s in ex.steps:
+            if s.status in (StepStatus.PENDING, StepStatus.IN_PROGRESS):
+                assert s.status == StepStatus.FAILED
+
+    def test_abort_no_active(self, cli_runner, app, tmp_storage):
+        result = cli_runner.invoke(app, ["exec", "abort"])
+        assert result.exit_code != 0
+
+
+class TestHistoryCommands:
+    def test_history_list(self, cli_runner, app, _seeded):
+        result = cli_runner.invoke(app, ["history", "list"])
+        assert result.exit_code == 0
+        assert "执行历史" in result.stdout
+        # ID 断言避免换行问题
+        assert "ex001" in result.stdout
+        assert "ex002" in result.stdout
+
+    def test_history_show(self, cli_runner, app, _seeded):
+        result = cli_runner.invoke(app, ["history", "show", "ex002"])
+        assert result.exit_code == 0
+        assert "处理总结" in result.stdout
+        assert "步骤 1" in result.stdout
+        assert "步骤 2" in result.stdout
+
+    def test_history_show_missing(self, cli_runner, app):
+        result = cli_runner.invoke(app, ["history", "show", "nope"])
+        assert result.exit_code != 0
+
+    def test_history_summary(self, cli_runner, app, _seeded):
+        result = cli_runner.invoke(app, ["history", "summary", "--last-days", "7"])
+        assert result.exit_code == 0
+        assert "执行统计摘要" in result.stdout
+        assert "成功率" in result.stdout
+
+    def test_history_summary_empty(self, cli_runner, app):
+        result = cli_runner.invoke(app, ["history", "summary"])
+        assert result.exit_code == 0
+        assert "暂无执行记录" in result.stdout
+
+    def test_history_export_json(self, cli_runner, app, _seeded, tmp_path):
+        out = tmp_path / "report.json"
+        result = cli_runner.invoke(
+            app,
+            ["history", "export", "ex002", "--format", "json", "-o", str(out)],
+        )
+        assert result.exit_code == 0
+        assert out.exists()
+        data = json.loads(out.read_text())
+        assert data["id"] == "ex002"
+        assert data["status"] == "completed"
+
+    def test_history_export_md(self, cli_runner, app, _seeded, tmp_path):
+        out = tmp_path / "report.md"
+        result = cli_runner.invoke(
+            app,
+            ["history", "export", "ex002", "--format", "md", "-o", str(out)],
+        )
+        assert result.exit_code == 0
+        content = out.read_text()
+        assert content.startswith("# 应急处理记录")
+        assert "处理总结" in content
+        assert "### 1." in content
+
+    def test_history_export_txt(self, cli_runner, app, _seeded, tmp_path):
+        out = tmp_path / "report.txt"
+        result = cli_runner.invoke(
+            app,
+            ["history", "export", "ex002", "--format", "txt", "-o", str(out)],
+        )
+        assert result.exit_code == 0
+        content = out.read_text()
+        assert "应急处理记录" in content
+        assert "【基本信息】" in content
+        assert "【执行步骤详情】" in content
+
+    def test_history_export_invalid_format(self, cli_runner, app, _seeded):
+        result = cli_runner.invoke(app, ["history", "export", "ex002", "--format", "xml"])
+        assert result.exit_code != 0
+        assert "不支持的格式" in result.stdout
+
+    def test_history_export_missing(self, cli_runner, app, tmp_path):
+        out = tmp_path / "x.json"
+        result = cli_runner.invoke(app, ["history", "export", "nope", "-o", str(out)])
+        assert result.exit_code != 0
+
+
+class TestDashboardInitDemo:
+    def test_dashboard_with_data(self, cli_runner, app, _seeded):
+        result = cli_runner.invoke(app, ["dashboard"])
+        assert result.exit_code == 0
+        assert "应急 Runbook 仪表板" in result.stdout
+        assert "预案总数" in result.stdout
+        assert "执行总数" in result.stdout
+
+    def test_init_demo(self, cli_runner, app, tmp_storage):
+        result = cli_runner.invoke(app, ["init-demo", "--force"])
+        assert result.exit_code == 0
+        rbs = tmp_storage.list_runbooks()
+        assert len(rbs) >= 3
