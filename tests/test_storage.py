@@ -181,3 +181,151 @@ class TestStorageRoundTrip:
         assert len(storage_with_data.list_executions()) == 2
         storage_with_data.delete_runbook(sample_runbook.id)
         assert len(storage_with_data.list_executions()) == 2
+
+
+class TestConcurrentWriteSafety:
+    def test_save_runbook_creates_lock_file(self, tmp_storage, sample_runbook):
+        tmp_storage.save_runbook(sample_runbook)
+        assert (tmp_storage._lock_dir / f"runbook-{sample_runbook.id}.lock").exists()
+
+    def test_save_execution_creates_lock_file(self, tmp_storage, sample_execution):
+        tmp_storage.save_execution(sample_execution)
+        assert (tmp_storage._lock_dir / f"execution-{sample_execution.id}.lock").exists()
+
+    def test_lock_dir_created(self, tmp_path):
+        from runbook_cli.storage import RunbookStorage
+        storage = RunbookStorage(base_dir=tmp_path)
+        assert (tmp_path / ".locks").exists()
+
+    def test_threaded_concurrent_runbook_saves_no_corruption(self, tmp_storage, sample_runbook):
+        import threading
+        import copy
+        from runbook_cli.models import Runbook
+
+        ids = [f"rb-thr-{i}" for i in range(20)]
+        errors = []
+        results: dict[str, Runbook | None] = {}
+        lock = threading.Lock()
+
+        def worker(i: int):
+            try:
+                rb = copy.deepcopy(sample_runbook)
+                rb.id = ids[i]
+                rb.name = f"Worker {i} Runbook"
+                rb.description = "x" * (1024 * 3)
+                tmp_storage.save_runbook(rb)
+                with lock:
+                    results[rb.id] = tmp_storage.load_runbook(rb.id)
+            except Exception as e:
+                with lock:
+                    errors.append((i, str(e)))
+
+        threads = [threading.Thread(target=worker, args=(i,)) for i in range(len(ids))]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=15)
+
+        assert errors == [], f"线程写入报错: {errors[:5]}"
+        for rid in ids:
+            loaded = results.get(rid)
+            assert loaded is not None, f"未读到 {rid}"
+            raw = (tmp_storage._runbook_path(rid)).read_text(encoding="utf-8")
+            parsed = json.loads(raw)
+            reparsed = Runbook.model_validate(parsed)
+            assert reparsed.id == rid
+
+    def test_threaded_concurrent_same_runbook_atomic_updates(self, tmp_storage, sample_runbook):
+        import threading
+        import copy
+
+        tmp_storage.save_runbook(sample_runbook)
+        errors = []
+        iterations = 30
+
+        def worker(i: int):
+            try:
+                for j in range(5):
+                    rb = tmp_storage.load_runbook(sample_runbook.id)
+                    if rb is None:
+                        continue
+                    rb.name = f"Update-{i}-{j}"
+                    rb.description = "y" * (1024 * 2)
+                    tmp_storage.save_runbook(rb)
+            except Exception as e:
+                errors.append((i, str(e)))
+
+        threads = [threading.Thread(target=worker, args=(i,)) for i in range(iterations)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=30)
+
+        assert errors == [], f"并发更新报错: {errors[:5]}"
+        loaded = tmp_storage.load_runbook(sample_runbook.id)
+        assert loaded is not None
+        raw = (tmp_storage._runbook_path(sample_runbook.id)).read_text(encoding="utf-8")
+        parsed = json.loads(raw)
+        assert parsed["id"] == sample_runbook.id
+
+    def test_process_fork_concurrent_execution_saves(self, tmp_storage, sample_execution):
+        import os
+        import multiprocessing as mp
+
+        def worker(base_dir_str, wid: int):
+            from runbook_cli.storage import RunbookStorage
+            from runbook_cli.models import ExecutionRecord
+            import copy
+            s = RunbookStorage(base_dir=Path(base_dir_str))
+            ex = copy.deepcopy(sample_execution)
+            ex.id = f"ex-fork-{wid}"
+            ex.summary = f"worker {wid} " + "z" * 4096
+            s.save_execution(ex)
+
+        # 使用 fork context
+        ctx = mp.get_context("fork")
+        procs = []
+        for i in range(8):
+            p = ctx.Process(target=worker, args=(str(tmp_storage.base_dir), i))
+            procs.append(p)
+            p.start()
+        for p in procs:
+            p.join(timeout=30)
+            assert p.exitcode == 0, f"子进程 {p.pid} 退出码 {p.exitcode}"
+
+        for i in range(8):
+            ex_id = f"ex-fork-{i}"
+            loaded = tmp_storage.load_execution(ex_id)
+            assert loaded is not None, f"子进程 {i} 写入的执行记录丢失"
+            raw = (tmp_storage._execution_path(ex_id)).read_text(encoding="utf-8")
+            parsed = json.loads(raw)
+            assert parsed["id"] == ex_id
+
+    def test_multiprocess_same_execution_updates_stay_valid(self, tmp_storage, sample_execution):
+        import multiprocessing as mp
+
+        tmp_storage.save_execution(sample_execution)
+        base = str(tmp_storage.base_dir)
+        ex_id = sample_execution.id
+
+        def worker(base_dir_str, wid: int):
+            from runbook_cli.storage import RunbookStorage
+            s = RunbookStorage(base_dir=Path(base_dir_str))
+            for _ in range(6):
+                ex = s.load_execution(ex_id)
+                if ex is None:
+                    continue
+                ex.summary = f"worker {wid} update"
+                s.save_execution(ex)
+
+        ctx = mp.get_context("fork")
+        procs = [ctx.Process(target=worker, args=(base, i)) for i in range(6)]
+        for p in procs:
+            p.start()
+        for p in procs:
+            p.join(timeout=30)
+            assert p.exitcode == 0
+
+        raw = (tmp_storage._execution_path(ex_id)).read_text(encoding="utf-8")
+        parsed = json.loads(raw)
+        assert parsed["id"] == ex_id

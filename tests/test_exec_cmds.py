@@ -346,7 +346,7 @@ class TestHistoryCommands:
         out = tmp_path / "report.json"
         result = cli_runner.invoke(
             app,
-            ["history", "export", "ex002", "--format", "json", "-o", str(out)],
+            ["history", "export", "ex002", "--format", "json", "-o", str(out), "--force-name"],
         )
         assert result.exit_code == 0
         assert out.exists()
@@ -358,7 +358,7 @@ class TestHistoryCommands:
         out = tmp_path / "report.md"
         result = cli_runner.invoke(
             app,
-            ["history", "export", "ex002", "--format", "md", "-o", str(out)],
+            ["history", "export", "ex002", "--format", "md", "-o", str(out), "--force-name"],
         )
         assert result.exit_code == 0
         content = out.read_text()
@@ -370,7 +370,7 @@ class TestHistoryCommands:
         out = tmp_path / "report.txt"
         result = cli_runner.invoke(
             app,
-            ["history", "export", "ex002", "--format", "txt", "-o", str(out)],
+            ["history", "export", "ex002", "--format", "txt", "-o", str(out), "--force-name"],
         )
         assert result.exit_code == 0
         content = out.read_text()
@@ -402,3 +402,109 @@ class TestDashboardInitDemo:
         assert result.exit_code == 0
         rbs = tmp_storage.list_runbooks()
         assert len(rbs) >= 3
+
+
+class TestHistoryExportNamingConvention:
+    def test_export_default_filename_matches_pattern(self, cli_runner, app, _seeded, sample_execution, tmp_path, monkeypatch):
+        out_dir = tmp_path / "exports"
+        out_dir.mkdir()
+        monkeypatch.chdir(out_dir)
+        result = cli_runner.invoke(app, ["history", "export", "ex001", "-f", "json"])
+        assert result.exit_code == 0, result.stdout
+        files = list(out_dir.glob("INC-*-v*.json"))
+        assert len(files) >= 1, f"未找到符合命名规范的文件: {list(out_dir.iterdir())}"
+        name = files[0].name
+        parts = name.rsplit("-v", 1)
+        assert len(parts) == 2
+        prefix, rest = parts
+        assert prefix.startswith("INC-")
+        main_parts = prefix.split("-")
+        assert len(main_parts) >= 4, f"INC-<日期>-<序号>-<缩写>-<日期> 分段不对: {main_parts}"
+        assert rest.endswith(".json")
+
+    def test_export_filename_starts_with_existing_incident_id(self, cli_runner, app, tmp_storage, sample_execution, sample_runbook, tmp_path, monkeypatch):
+        sample_execution.incident_id = "INC-20260610-007"
+        tmp_storage.save_runbook(sample_runbook)
+        tmp_storage.save_execution(sample_execution)
+        out_dir = tmp_path / "exp2"
+        out_dir.mkdir()
+        monkeypatch.chdir(out_dir)
+        result = cli_runner.invoke(app, ["history", "export", sample_execution.id, "-f", "md"])
+        assert result.exit_code == 0, result.stdout
+        files = list(out_dir.glob("INC-20260610-007-*-v*.md"))
+        assert len(files) >= 1
+
+    def test_export_version_increments(self, cli_runner, app, _seeded, sample_execution, tmp_path, monkeypatch):
+        out_dir = tmp_path / "exp3"
+        out_dir.mkdir()
+        monkeypatch.chdir(out_dir)
+        for i in range(3):
+            r = cli_runner.invoke(app, ["history", "export", "ex001", "-f", "txt"])
+            assert r.exit_code == 0, r.stdout
+        files = sorted(out_dir.glob("INC-*-v*.txt"))
+        versions = []
+        for f in files:
+            m = __import__("re").search(r"-v(\d+)\.txt$", f.name)
+            assert m is not None, f.name
+            versions.append(int(m.group(1)))
+        assert sorted(versions) == list(range(1, len(versions) + 1))
+        assert 3 in versions or len(versions) >= 3
+
+    def test_export_output_dir_still_generates_name(self, cli_runner, app, _seeded, tmp_path):
+        out_dir = tmp_path / "exp4"
+        out_dir.mkdir()
+        result = cli_runner.invoke(app, ["history", "export", "ex001", "-f", "json", "-o", str(out_dir)])
+        assert result.exit_code == 0, result.stdout
+        files = list(out_dir.glob("INC-*-v*.json"))
+        assert len(files) >= 1
+
+    def test_export_force_name_allows_custom(self, cli_runner, app, _seeded, tmp_path):
+        out_file = tmp_path / "my-custom-name.json"
+        result = cli_runner.invoke(
+            app,
+            ["history", "export", "ex001", "-f", "json", "-o", str(out_file), "--force-name"],
+        )
+        assert result.exit_code == 0, result.stdout
+        assert out_file.exists()
+        assert out_file.name == "my-custom-name.json"
+
+    def test_export_strict_name_ignores_custom_filename_parent(self, cli_runner, app, _seeded, tmp_path):
+        out_file = tmp_path / "my-custom-name.json"
+        result = cli_runner.invoke(
+            app,
+            ["history", "export", "ex001", "-f", "json", "-o", str(out_file), "--strict-name"],
+        )
+        assert result.exit_code == 0, result.stdout
+        assert not out_file.exists()
+        norm = list(tmp_path.glob("INC-*-v*.json"))
+        assert len(norm) >= 1
+
+    def test_export_runbook_abbreviation_uses_tag(self, cli_runner, app, tmp_storage, sample_execution, sample_runbook, tmp_path, monkeypatch):
+        sample_runbook.tags = ["mysql-failover"]
+        tmp_storage.save_runbook(sample_runbook)
+        sample_execution.incident_id = "INC-20260610-012"
+        tmp_storage.save_execution(sample_execution)
+        out_dir = tmp_path / "exp-tags"
+        out_dir.mkdir()
+        monkeypatch.chdir(out_dir)
+        r = cli_runner.invoke(app, ["history", "export", sample_execution.id, "-f", "md"])
+        assert r.exit_code == 0, r.stdout
+        files = list(out_dir.iterdir())
+        assert any("mysql-failover" in f.name for f in files), f"未找到含标签缩写的文件: {[f.name for f in files]}"
+
+    def test_export_autogenerates_incident_id_when_missing(self, cli_runner, app, tmp_storage, sample_execution, sample_runbook, tmp_path, monkeypatch):
+        sample_execution.incident_id = None
+        tmp_storage.save_runbook(sample_runbook)
+        tmp_storage.save_execution(sample_execution)
+        out_dir = tmp_path / "exp-inc-gen"
+        out_dir.mkdir()
+        monkeypatch.chdir(out_dir)
+        r = cli_runner.invoke(app, ["history", "export", sample_execution.id, "-f", "json"])
+        assert r.exit_code == 0, r.stdout
+        files = list(out_dir.glob("INC-*-v*.json"))
+        assert len(files) >= 1
+        updated = tmp_storage.load_execution(sample_execution.id)
+        assert updated is not None
+        assert updated.incident_id is not None
+        import re
+        assert re.match(r"^INC-\d{8}-\d{3}$", updated.incident_id)

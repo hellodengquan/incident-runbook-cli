@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
@@ -13,6 +14,70 @@ from .. import ui
 
 app = typer.Typer(help="处理记录回顾与导出", no_args_is_help=True)
 storage = RunbookStorage()
+
+_INC_ID_RE = re.compile(r"^INC-\d{8}-\d{3}$")
+
+
+def _sanitize_abbreviation(text: str) -> str:
+    cleaned = re.sub(r"[^A-Za-z0-9]", "-", text).strip("-")
+    cleaned = re.sub(r"-+", "-", cleaned)
+    return cleaned[:24]
+
+
+def _inc_prefix(execution) -> str:
+    if execution.incident_id and _INC_ID_RE.match(execution.incident_id):
+        return execution.incident_id
+    base = execution.started_at or datetime.now()
+    ts = base.strftime("%Y%m%d")
+    count = 1
+    prefix = f"INC-{ts}-{count:03d}"
+    while True:
+        used = False
+        for ex in storage.list_executions():
+            if ex.incident_id == prefix and ex.id != execution.id:
+                used = True
+                break
+        if not used and execution.incident_id != prefix:
+            break
+        count += 1
+        prefix = f"INC-{ts}-{count:03d}"
+    if not execution.incident_id:
+        execution.incident_id = prefix
+        storage.save_execution(execution)
+    return prefix
+
+
+def _runbook_abbreviation(execution) -> str:
+    rb = storage.load_runbook(execution.runbook_id)
+    if rb and rb.tags:
+        for tag in rb.tags:
+            if 2 <= len(tag) <= 24 and _sanitize_abbreviation(tag) == tag:
+                return tag
+    return _sanitize_abbreviation(execution.runbook_name)
+
+
+def _detect_version(output_dir: Path, base_stem: str) -> int:
+    version = 1
+    pattern = f"{base_stem}-v*.*"
+    existing = list(output_dir.glob(pattern))
+    if existing:
+        for f in existing:
+            m = re.search(r"-v(\d+)(\.[^.]+)?$", f.name)
+            if m:
+                version = max(version, int(m.group(1)) + 1)
+    return version
+
+
+def _build_export_filename(execution, suffix: str, output_dir: Optional[Path] = None) -> Path:
+    if output_dir is None:
+        output_dir = Path.cwd()
+    output_dir = Path(output_dir)
+    inc = _inc_prefix(execution)
+    abbrev = _runbook_abbreviation(execution)
+    date_str = (execution.started_at or datetime.now()).strftime("%Y%m%d")
+    base_stem = f"{inc}-{abbrev}-{date_str}"
+    version = _detect_version(output_dir, base_stem)
+    return output_dir / f"{base_stem}-v{version}{suffix}"
 
 
 @app.command("list")
@@ -72,9 +137,14 @@ def export_record(
     format: str = typer.Option(
         "json", "--format", "-f", help="导出格式: json, md (markdown), txt"
     ),
-    output: Optional[Path] = typer.Option(None, "--output", "-o", help="输出文件路径"),
+    output: Optional[Path] = typer.Option(None, "--output", "-o", help="输出目录或完整文件路径（若给目录则自动生成规范文件名）"),
+    force_name: bool = typer.Option(
+        False,
+        "--force-name/--strict-name",
+        help="--force-name 允许使用自定义文件名，--strict-name（默认）强制按 INC-* 命名规范自动生成",
+    ),
 ):
-    """导出执行记录为文件"""
+    """导出执行记录为文件（默认强制按 INC-<事件ID>-<预案缩写>-<日期>-v<版本>.<后缀> 命名）"""
     execution = storage.load_execution(execution_id)
     if execution is None:
         ui.error(f"执行记录不存在: {execution_id}")
@@ -96,12 +166,21 @@ def export_record(
         default_suffix = ".txt"
 
     if output is None:
-        ts = (execution.started_at or datetime.now()).strftime("%Y%m%d-%H%M%S")
-        output = Path.cwd() / f"runbook-{execution.runbook_name}-{ts}{default_suffix}"
+        final_path = _build_export_filename(execution, default_suffix)
+    else:
+        output_p = Path(output)
+        if output_p.suffix and output_p.parent != output_p:
+            if force_name:
+                final_path = output_p
+            else:
+                final_path = _build_export_filename(execution, output_p.suffix or default_suffix, output_p.parent)
+                ui.info(f"--strict-name 模式启用，规范命名：{final_path.name}（使用 --force-name 可覆盖）")
+        else:
+            final_path = _build_export_filename(execution, default_suffix, output_p)
 
-    output.parent.mkdir(parents=True, exist_ok=True)
-    output.write_text(content, encoding="utf-8")
-    ui.success(f"已导出到: {output}")
+    final_path.parent.mkdir(parents=True, exist_ok=True)
+    final_path.write_text(content, encoding="utf-8")
+    ui.success(f"已导出到: {final_path}")
 
 
 def _render_markdown(execution) -> str:
