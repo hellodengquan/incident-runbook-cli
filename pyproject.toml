@@ -1,0 +1,21 @@
+[project]
+name = "runbook-cli"
+version = "1.0.0"
+description = "应急 Runbook CLI 工具 - 预案清单管理、执行步骤追踪、处理记录回顾"
+requires-python = ">=3.9"
+dependencies = [
+    "typer>=0.12.0",
+    "rich>=13.7.0",
+    "pydantic>=2.6.0",
+    "python-dateutil>=2.8.2",
+]
+
+[project.scripts]
+runbook = "runbook_cli.main:app"
+
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
