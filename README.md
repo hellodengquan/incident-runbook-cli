@@ -224,13 +224,118 @@ incident-runbook-cli/
     ├── __init__.py
     ├── main.py                 # Typer 主入口，集成所有子命令
     ├── models.py               # Pydantic 数据模型
-    ├── storage.py              # JSON 文件存储层
+    ├── storage.py              # JSON 文件存储层（含跨平台锁）
     ├── ui.py                   # Rich UI 组件（表格/颜色/进度条）
     └── commands/
         ├── __init__.py
         ├── runbook_cmds.py     # 预案管理命令
         ├── exec_cmds.py        # 执行追踪命令
-        └── history_cmds.py     # 历史回顾命令
+        ├── history_cmds.py     # 历史回顾命令
+        └── admin_cmds.py       # 运维管理（锁清理/诊断）
+```
+
+## 并发与锁
+
+多人值班时，多人/多 shell 同时操作同一数据目录会导致 JSON 半写损坏。runbook-cli 在 `storage.py` 内实现了**跨平台文件锁** + **原子替换**双保险，并辅以**孤儿锁自动清理**。
+
+### 1. 三种锁实现（按平台自动选择）
+
+| 实现类 | 平台 | 底层 API | 说明 |
+|--------|------|----------|------|
+| `_FcntlLock` | POSIX（Linux / macOS / BSD） | `fcntl.flock(fd, LOCK_EX)` | 内核级建议锁，`LOCK_EX` 跨进程独占；持锁进程崩溃由内核自动释放 |
+| `_MsvcrtLock` | Windows | `msvcrt.locking(fd, _LK_LOCK, 0x7FFFFFFF)` | MSVC 运行时锁定，锁定从文件头起 `2GB` 范围 |
+| `_NoopPlatformLock` | 兜底（两者都不可用） | 无系统调用 | 不提供真实互斥，仍保留 PID 标记 + stale 清理，靠 `os.replace()` 原子性兜底 |
+
+> **选择逻辑**：`new_platform_lock()` 读取 `sys.platform`，`win32` 尝试 `import msvcrt`，否则 fallback 到 `_FcntlLock`（需 `import fcntl`），再退化到 `_NoopPlatformLock`。
+
+### 2. 双保险写入流程
+
+每次 `save_runbook` / `save_execution` 都会执行：
+
+```
+① 获取记录级排他锁（fcntl / msvcrt）
+   │
+   ├─ 获取前运行 stale 检测（见 §3）
+   │
+② 写临时文件：<target>.NNNNNN.tmp（NamedTemporaryFile，与目标同目录 → 保证同一 FS）
+   │
+③ os.replace(tmp, target)  —— 原子 rename 系统调用
+   │
+④ 释放锁并关闭 fd
+```
+
+即使并发中锁完全失效（Noop 模式或 Windows 9x），`os.replace()` 仍保证目标文件要么是完整的旧版本，要么是完整的新版本，**绝不会出现半截 JSON**。
+
+### 3. 孤儿锁（Stale Lock）检测与清理
+
+锁文件除了被系统持有锁外，还会写入文本标记：`PID:<持有者PID>:<unix_ts时间戳>\n`
+
+**清理触发点**：
+- **写路径自动**：每次 `lock.acquire()` 前执行 `_try_recover_stale_lock()`，若锁已陈旧则 unlink 重建
+- **运维命令**：`runbook admin clean-locks` 可定期或事故后批量扫描
+
+**陈旧判定条件（满足任一即判为孤儿）**：
+
+| 条件 | 说明 |
+|------|------|
+| 标记的 PID 不存在（`_pid_alive(pid)` 为 False） | 持锁进程已崩溃/被杀 |
+| 锁年龄 `> STALE_LOCK_MAX_AGE_SECONDS = 21600 秒（6 小时）` | 时间戳太老即使 PID 被重用也安全清理 |
+| 空文件 + mtime 超阈值 | 早期版本遗留的无标记锁文件 |
+
+**PID 存活检测原理**：
+
+| 平台 | 实现 |
+|------|------|
+| POSIX | `os.kill(pid, 0)` —— 空信号：返回成功则进程存在，`ESRCH` 说明不存在，`EPERM` 说明存在但无权限（视为存活） |
+| Windows | `kernel32.OpenProcess(PROCESS_QUERY_INFORMATION | SYNCHRONIZE)` → `GetExitCodeProcess` → 若等于 `STILL_ACTIVE(259)` 判为存活，否则已退出；`CloseHandle` 收尾 |
+
+### 4. 6 小时阈值的依据
+
+`STALE_LOCK_MAX_AGE_SECONDS = 60 * 60 * 6 = 21600s`：
+
+1. **值班周期覆盖**：一线 SRE 常见值班为 8h 白班 / 12h 夜班 / 24h oncall，取 6h 恰好是一次标准故障处置（含事后复盘）的**上限 2～3 倍**，真锁不应被误判为孤儿；
+2. **PID 复用安全**：Linux 默认 `pid_max=32768`，繁忙主机一天内 PID 可能复用 2 次以上，6 小时窗口极大概率**不会**把重用的 PID 当成原持有者；
+3. **锁堆积容忍**：每人每命令一个锁文件（大小 20～40 字节），6 小时累积量即使极端情况也只有几百个，占磁盘可忽略；
+4. **可调整**：`clean-locks` 的 `--max-age N` 可按实际运维节奏动态覆盖（例如一周清理改成 `--max-age 604800`）。
+
+### 5. 运维操作方法
+
+#### (1) 诊断锁系统状态
+
+```bash
+runbook admin lock-info
+```
+
+输出：当前平台、锁实现类、锁目录路径、活跃 / 孤儿 / 未知 锁数量、6 小时阈值、PID 检测方式。
+
+#### (2) 预演清理（DRY-RUN，推荐先跑）
+
+```bash
+# 只列出将被清理的孤儿锁，不删文件
+runbook admin clean-locks --dry-run -v
+# 自定义阈值 30 分钟：更激进地清理
+runbook admin clean-locks --dry-run --max-age 1800
+```
+
+`-v` 模式下会打印 Rich 表格：锁文件名、持有者 PID、PID 是否活、锁龄、keep/stale 状态、判定原因。
+
+#### (3) 实际清理
+
+```bash
+# 常规清理（阈值 = 6h）
+runbook admin clean-locks
+
+# 故障后立即清理（阈值 = 1 分钟）
+runbook admin clean-locks --max-age 60 -v
+```
+
+返回结果会列出**实际删除数量**，并对「本应删除但仍残留」的文件给出 yellow warning（通常是被其他进程重新持有，属正常情况）。
+
+#### (4) 建议巡检 cron
+
+```cron
+# 每天 04:00 值班交接前后清理一遍，-v 结果投递到日志
+0 4 * * * /usr/local/bin/runbook admin clean-locks --max-age 7200 -v >> /var/log/runbook-clean-locks.log 2>&1
 ```
 
 ## 许可证

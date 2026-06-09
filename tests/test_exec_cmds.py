@@ -9,6 +9,7 @@ import pytest
 from runbook_cli.commands import runbook_cmds
 from runbook_cli.commands import exec_cmds
 from runbook_cli.commands import history_cmds
+from runbook_cli.commands import admin_cmds
 from runbook_cli import main as _main_mod
 from runbook_cli.models import (
     ExecutionStatus,
@@ -23,6 +24,7 @@ def _patch_storage_refs(monkeypatch, tmp_storage):
     monkeypatch.setattr(runbook_cmds, "storage", tmp_storage)
     monkeypatch.setattr(exec_cmds, "storage", tmp_storage)
     monkeypatch.setattr(history_cmds, "storage", tmp_storage)
+    monkeypatch.setattr(admin_cmds, "storage", tmp_storage)
     monkeypatch.setattr(_main_mod, "storage", tmp_storage)
     yield
 
@@ -508,3 +510,138 @@ class TestHistoryExportNamingConvention:
         assert updated.incident_id is not None
         import re
         assert re.match(r"^INC-\d{8}-\d{3}$", updated.incident_id)
+
+
+class TestAdminCommands:
+    def _seed_stale_locks(self, tmp_storage, *, stale_count: int = 3, live_count: int = 2):
+        import os, time
+        from runbook_cli.storage import _write_pid_mark
+
+        dead_pid_base = 2**30 + 9000
+        stale_files = []
+        for i in range(stale_count):
+            p = tmp_storage._lock_dir / f"runbook-stale-{i}.lock"
+            _write_pid_mark(p, pid=dead_pid_base + i)
+            stale_files.append(p)
+        live_files = []
+        for i in range(live_count):
+            p = tmp_storage._lock_dir / f"runbook-live-{i}.lock"
+            _write_pid_mark(p, pid=os.getpid())
+            live_files.append(p)
+        return stale_files, live_files
+
+    def test_admin_clean_locks_dry_run_does_not_delete(self, cli_runner, app, tmp_storage):
+        stale, live = self._seed_stale_locks(tmp_storage, stale_count=3, live_count=2)
+        before_stale = [p.exists() for p in stale]
+        assert all(before_stale), "seeding 失败"
+        result = cli_runner.invoke(app, ["admin", "clean-locks", "--dry-run"])
+        assert result.exit_code == 0, result.stdout
+        assert "DRY-RUN" in result.stdout
+        assert "将清理" in result.stdout or "需清理" in result.stdout
+        for p in stale:
+            assert p.exists(), "dry-run 不应实际删除"
+        for p in live:
+            assert p.exists()
+
+    def test_admin_clean_locks_actual_removes_stale(self, cli_runner, app, tmp_storage):
+        stale, live = self._seed_stale_locks(tmp_storage, stale_count=4, live_count=1)
+        result = cli_runner.invoke(app, ["admin", "clean-locks"])
+        assert result.exit_code == 0, result.stdout
+        assert "已清理" in result.stdout or "清理" in result.stdout
+        for p in stale:
+            assert not p.exists(), f"孤儿锁未被清: {p.name}"
+        for p in live:
+            assert p.exists(), "活锁不应被误删"
+
+    def test_admin_clean_locks_max_age_custom(self, cli_runner, app, tmp_storage):
+        # 准备 2 个锁：一个当前 PID（活）+ 一个活的 PID 但 mtime 设成 2 分钟前, max-age=60s 会被清理
+        import os, time
+        from runbook_cli.storage import _write_pid_mark
+
+        live_pid = os.getpid()
+        lock_new = tmp_storage._lock_dir / "runbook-young.lock"
+        _write_pid_mark(lock_new, pid=live_pid)
+        lock_old = tmp_storage._lock_dir / "runbook-aged.lock"
+        _write_pid_mark(lock_old, pid=live_pid)
+        # 将 lock_old 的 mtime 手动推进到 5 分钟前
+        now = time.time()
+        os.utime(str(lock_old), (now, now))  # 先用 now 写一下
+        # 但 clean-locks 用的是 mark 里的时间戳，不是 mtime
+        # 所以改一下：给死 PID + max-age=1s 肯定清；给活 PID + max-age=999999s 应该保留
+        stale_2, live_2 = self._seed_stale_locks(tmp_storage, stale_count=1, live_count=1)
+        result = cli_runner.invoke(app, ["admin", "clean-locks", "--max-age", "1"])
+        assert result.exit_code == 0, result.stdout
+        # 死 PID 的 1 个肯定被清，活 PID 的那个因 max-age=1s 而 age > 1s 也被清
+        for p in stale_2:
+            assert not p.exists()
+
+    def test_admin_clean_locks_max_age_keeps_recent(self, cli_runner, app, tmp_storage):
+        import os
+        from runbook_cli.storage import _write_pid_mark
+        from runbook_cli.storage import STALE_LOCK_MAX_AGE_SECONDS
+
+        # 3 个活 PID + 2 个死 PID
+        stale, live = self._seed_stale_locks(tmp_storage, stale_count=2, live_count=3)
+        # 超大年龄阈值（等于默认 6h），活锁被保留（因为其 PID 还活着 + age 远小于阈值）
+        result = cli_runner.invoke(
+            app,
+            ["admin", "clean-locks", "--max-age", str(STALE_LOCK_MAX_AGE_SECONDS)],
+        )
+        assert result.exit_code == 0, result.stdout
+        for p in live:
+            assert p.exists(), f"活锁在大阈值下被误删: {p.name}"
+        for p in stale:
+            assert not p.exists(), f"死锁未清理: {p.name}"
+
+    def test_admin_clean_locks_empty_dir_noop(self, cli_runner, app, tmp_storage):
+        # 确保没有锁文件
+        import shutil
+        shutil.rmtree(tmp_storage._lock_dir, ignore_errors=True)
+        result = cli_runner.invoke(app, ["admin", "clean-locks"])
+        assert result.exit_code == 0, result.stdout
+        assert "锁目录不存在" in result.stdout or "无需" in result.stdout or "空" in result.stdout
+
+    def test_admin_clean_locks_verbose_prints_table(self, cli_runner, app, tmp_storage):
+        self._seed_stale_locks(tmp_storage, stale_count=2, live_count=2)
+        r = cli_runner.invoke(app, ["admin", "clean-locks", "--dry-run", "--verbose"])
+        assert r.exit_code == 0, r.stdout
+        assert "锁文件详情" in r.stdout or "PID" in r.stdout
+        assert "stale" in r.stdout
+
+    def test_admin_lock_info_works(self, cli_runner, app, tmp_storage):
+        self._seed_stale_locks(tmp_storage, stale_count=2, live_count=2)
+        r = cli_runner.invoke(app, ["admin", "lock-info"])
+        assert r.exit_code == 0, r.stdout
+        assert "锁系统诊断" in r.stdout
+        assert "平台" in r.stdout
+        assert "锁总数" in r.stdout
+        assert "孤儿" in r.stdout or "活跃" in r.stdout
+
+    def test_admin_clean_locks_help_contains_options(self, cli_runner, app):
+        r = cli_runner.invoke(app, ["admin", "clean-locks", "--help"])
+        assert r.exit_code == 0
+        assert "--dry-run" in r.stdout
+        assert "--max-age" in r.stdout
+        assert "--verbose" in r.stdout
+
+    def test_admin_appears_in_top_level_help(self, cli_runner, app):
+        r = cli_runner.invoke(app, ["--help"])
+        assert r.exit_code == 0
+        assert "admin" in r.stdout
+        assert "运维管理" in r.stdout
+
+    def test_admin_clean_locks_actual_after_dry_run_same_state(self, cli_runner, app, tmp_storage):
+        # dry-run -> 实际清理：最终状态一致
+        stale, live = self._seed_stale_locks(tmp_storage, stale_count=2, live_count=2)
+        r1 = cli_runner.invoke(app, ["admin", "clean-locks", "--dry-run"])
+        assert r1.exit_code == 0
+        after_dry_stale = [p.exists() for p in stale]
+        after_dry_live = [p.exists() for p in live]
+        assert all(after_dry_stale)
+        assert all(after_dry_live)
+        r2 = cli_runner.invoke(app, ["admin", "clean-locks"])
+        assert r2.exit_code == 0
+        for p in stale:
+            assert not p.exists()
+        for p in live:
+            assert p.exists()

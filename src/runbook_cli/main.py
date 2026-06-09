@@ -9,6 +9,7 @@ from . import __version__, ui
 from .commands.runbook_cmds import app as runbook_app
 from .commands.exec_cmds import app as exec_app
 from .commands.history_cmds import app as history_app
+from .commands.admin_cmds import app as admin_app
 from .storage import RunbookStorage
 
 app = typer.Typer(
@@ -22,6 +23,7 @@ app = typer.Typer(
 app.add_typer(runbook_app, name="runbook", help="预案清单管理（创建/查看/编辑/删除）")
 app.add_typer(exec_app, name="exec", help="执行追踪（开始/步骤/暂停/恢复）")
 app.add_typer(history_app, name="history", help="历史记录（回顾/统计/导出）")
+app.add_typer(admin_app, name="admin", help="运维管理（锁清理/诊断）")
 
 storage = RunbookStorage()
 
