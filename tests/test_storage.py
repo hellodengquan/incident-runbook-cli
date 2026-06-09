@@ -329,3 +329,215 @@ class TestConcurrentWriteSafety:
         raw = (tmp_storage._execution_path(ex_id)).read_text(encoding="utf-8")
         parsed = json.loads(raw)
         assert parsed["id"] == ex_id
+
+
+class TestPlatformLockSelection:
+    def test_lock_factory_default_system_returns_correct_classes(self):
+        from runbook_cli.storage import (
+            lock_implementation_class,
+            _FcntlLock,
+            _MsvcrtLock,
+            _NoopPlatformLock,
+        )
+
+        assert lock_implementation_class("darwin") is _FcntlLock
+        assert lock_implementation_class("macos") is _FcntlLock
+        assert lock_implementation_class("linux") is _FcntlLock
+        assert lock_implementation_class("posix") is _FcntlLock
+        assert lock_implementation_class("freebsd") is _FcntlLock
+        assert lock_implementation_class("win32") is _MsvcrtLock
+        assert lock_implementation_class("windows") is _MsvcrtLock
+        assert lock_implementation_class("noop") is _NoopPlatformLock
+        assert lock_implementation_class("POSIX") is _FcntlLock
+
+    def test_new_platform_lock_posix_uses_fcntl(self, tmp_path):
+        from runbook_cli.storage import new_platform_lock, _FcntlLock
+
+        lock = new_platform_lock(tmp_path / "x.lock", platform="darwin")
+        assert isinstance(lock, _FcntlLock)
+
+    def test_new_platform_lock_win32_uses_msvcrt_or_noop(self, tmp_path):
+        from runbook_cli.storage import (
+            new_platform_lock,
+            _MsvcrtLock,
+            _NoopPlatformLock,
+            _FcntlLock,
+        )
+
+        lock = new_platform_lock(tmp_path / "w.lock", platform="win32")
+        assert isinstance(lock, (_MsvcrtLock, _NoopPlatformLock, _FcntlLock))
+
+    def test_new_platform_lock_native_selection_matches_system(self, tmp_path):
+        import sys
+        from runbook_cli.storage import new_platform_lock, lock_implementation_class
+
+        expected_cls = lock_implementation_class(sys.platform)
+        lock = new_platform_lock(tmp_path / "n.lock")
+        assert type(lock).__name__ == expected_cls.__name__
+        assert lock.held is False
+
+    def test_acquire_sets_held_flag_and_writes_pid_mark(self, tmp_path):
+        from runbook_cli.storage import new_platform_lock, _read_pid_mark
+        import os
+
+        lock = new_platform_lock(tmp_path / "h.lock")
+        lock.acquire()
+        try:
+            assert lock.held is True
+            mark = _read_pid_mark(tmp_path / "h.lock")
+            assert mark is not None
+            pid, ts = mark
+            assert pid == os.getpid()
+            assert ts > 0
+        finally:
+            lock.release()
+            lock.close()
+
+    def test_release_clears_held_flag(self, tmp_path):
+        from runbook_cli.storage import new_platform_lock
+
+        lock = new_platform_lock(tmp_path / "g.lock")
+        lock.acquire()
+        assert lock.held is True
+        lock.release()
+        assert lock.held is False
+        lock.close()
+
+    def test_close_fd_on_closed_lock_no_error(self, tmp_path):
+        from runbook_cli.storage import new_platform_lock
+
+        lock = new_platform_lock(tmp_path / "c.lock")
+        lock.acquire()
+        lock.release()
+        lock.close()
+        lock.close()
+        lock2 = new_platform_lock(tmp_path / "c.lock")
+        lock2.acquire()
+        lock2.release()
+        lock2.close()
+
+    def test_msvcrt_lock_constants_match_known_values(self):
+        from runbook_cli.storage import _MsvcrtLock
+
+        assert _MsvcrtLock._LOCK_FILE == 0x0002
+        assert _MsvcrtLock._UNLOCK_FILE == 0x0000
+
+
+class TestStaleLockCleanup:
+    def test_cleanup_stale_locks_removes_orphan_pid_marked_files(self, tmp_storage):
+        from runbook_cli.storage import _write_pid_mark, STALE_LOCK_MAX_AGE_SECONDS
+        import os
+
+        fake_dead_pid = 2**30 + 42
+        dead_lock_1 = tmp_storage._lock_dir / "runbook-rb-orphan1.lock"
+        dead_lock_2 = tmp_storage._lock_dir / "execution-ex-orphan2.lock"
+        live_lock = tmp_storage._lock_dir / "runbook-rb-live.lock"
+
+        _write_pid_mark(dead_lock_1, pid=fake_dead_pid)
+        _write_pid_mark(dead_lock_2, pid=fake_dead_pid + 1)
+        _write_pid_mark(live_lock, pid=os.getpid())
+
+        assert dead_lock_1.exists()
+        assert dead_lock_2.exists()
+        assert live_lock.exists()
+
+        removed = tmp_storage.cleanup_stale_locks(max_age_seconds=STALE_LOCK_MAX_AGE_SECONDS)
+        assert removed >= 2
+        assert not dead_lock_1.exists(), "孤儿锁 1 未被清理"
+        assert not dead_lock_2.exists(), "孤儿锁 2 未被清理"
+        assert live_lock.exists(), "活着的 PID 不该被误删"
+
+    def test_stale_lock_removed_on_acquire_when_pid_dead(self, tmp_storage):
+        from runbook_cli.storage import _write_pid_mark, new_platform_lock, _read_pid_mark
+        import os
+
+        lock_path = tmp_storage._lock_dir / "execution-x99.lock"
+        fake_dead_pid = 2**30 + 777
+        _write_pid_mark(lock_path, pid=fake_dead_pid)
+        assert lock_path.exists()
+
+        lock = new_platform_lock(lock_path)
+        try:
+            lock.acquire()
+            mark = _read_pid_mark(lock_path)
+            assert mark is not None
+            pid, _ = mark
+            assert pid == os.getpid()
+        finally:
+            lock.release()
+            lock.close()
+
+    def test_age_based_stale_cleanup_ignores_recent(self, tmp_storage):
+        from runbook_cli.storage import _write_pid_mark
+        import os, time
+
+        lock_path = tmp_storage._lock_dir / "runbook-recent.lock"
+        _write_pid_mark(lock_path, pid=os.getpid())
+        now = time.time()
+        os.utime(str(lock_path), (now, now - 60))
+        removed = tmp_storage.cleanup_stale_locks(max_age_seconds=5)
+        assert removed == 0
+        assert lock_path.exists()
+
+    def test_age_based_cleanup_removes_old_empty_files(self, tmp_storage):
+        import os, time
+
+        lock_path = tmp_storage._lock_dir / "execution-ancient-empty.lock"
+        lock_path.write_bytes(b"")
+        old = time.time() - (7 * 24 * 3600)
+        os.utime(str(lock_path), (old, old))
+        assert lock_path.exists()
+        removed = tmp_storage.cleanup_stale_locks(max_age_seconds=60)
+        assert removed >= 1
+        assert not lock_path.exists()
+
+    def test_cleanup_without_lock_dir_returns_zero(self, tmp_path):
+        from runbook_cli.storage import RunbookStorage
+        import shutil
+
+        s = RunbookStorage(base_dir=tmp_path)
+        shutil.rmtree(s._lock_dir, ignore_errors=True)
+        assert s.cleanup_stale_locks() == 0
+
+    def test_cleanup_count_mixed_valid_and_stale(self, tmp_storage):
+        from runbook_cli.storage import _write_pid_mark
+        import os
+
+        dead_pid_base = 2**29 + 1
+        stale_locks = []
+        for i in range(5):
+            p = tmp_storage._lock_dir / f"stale-{i}.lock"
+            _write_pid_mark(p, pid=dead_pid_base + i)
+            stale_locks.append(p)
+        live_locks = []
+        for i in ("A", "B"):
+            p = tmp_storage._lock_dir / f"live-{i}.lock"
+            _write_pid_mark(p, pid=os.getpid())
+            live_locks.append(p)
+        for p in stale_locks + live_locks:
+            assert p.exists()
+        removed = tmp_storage.cleanup_stale_locks()
+        assert removed == 5
+        surviving = list(tmp_storage._lock_dir.glob("live-*.lock"))
+        assert len(surviving) == 2
+
+    def test_pid_alive_self_is_true(self):
+        from runbook_cli.storage import _pid_alive
+        import os
+        assert _pid_alive(os.getpid()) is True
+
+    def test_pid_alive_impossible_is_false(self):
+        from runbook_cli.storage import _pid_alive
+        assert _pid_alive(0) is False
+        assert _pid_alive(-1) is False
+
+    def test_malformed_mark_cleanup_via_age(self, tmp_storage):
+        import os, time
+
+        bad = tmp_storage._lock_dir / "runbook-malformed.lock"
+        bad.write_text("NOT-A-PID-MARK\n", encoding="utf-8")
+        old = time.time() - 7 * 86400
+        os.utime(str(bad), (old, old))
+        removed = tmp_storage.cleanup_stale_locks(max_age_seconds=60)
+        assert removed >= 0
+
